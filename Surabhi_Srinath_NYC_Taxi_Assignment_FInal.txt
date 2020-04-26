@@ -1,0 +1,390 @@
+--Set the following parameters on our Hue Notebook:
+
+-- Set the data to be inserted data dynamically into your partitioned table.
+SET hive.exec.dynamic.partition = true;
+
+-- Define Maximum number of dynamic partitions allowed to be created in total
+SET hive.exec.max.dynamic.partitions = 100000;
+
+-- Define Maximum number of dynamic partitions allowed to be created in each mapper/reducer node.
+SET hive.exec.max.dynamic.partitions.pernode = 100000;
+
+-- Pre-requisites - Set ENVIRONMENT variable
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+-- We have already created the ss database
+
+-- Use Database
+USE ss;
+
+-- DATA LOADING
+
+-- Drop table if it already exists
+DROP TABLE  ss_nyc;
+
+
+-- Assumptions 
+-- integers are defined as int 
+-- floating points are defined  as double
+-- ID columns are defined as string
+
+-- Create table
+CREATE EXTERNAL TABLE IF NOT EXISTS ss.ss_nyc
+(
+VendorID string,
+tpep_pickup_datetime TIMESTAMP,
+tpep_dropoff_datetime TIMESTAMP,
+passenger_count	INT,
+trip_distance DOUBLE,
+RatecodeID STRING,
+store_and_fwd_flag STRING,
+PULocationID STRING,
+DOLocationID STRING,
+payment_type STRING,
+fare_amount	DOUBLE,
+extra DOUBLE,
+mta_tax	DOUBLE,
+tip_amount DOUBLE,
+tolls_amount DOUBLE,
+improvement_surcharge DOUBLE,
+total_amount DOUBLE
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES ("separatorChar" = ",") 
+location '/common_folder/nyc_taxi_data'
+tblproperties ("skip.header.line.count"="1");
+
+-- VERIFY TABLE STRUCTURE AND DATA TYPES
+SELECT * FROM ss.ss_nyc LIMIT 3;
+
+-- Basic Data Quality Checks
+-- How many records has each TPEP provider provided? 
+-- Write a query that summarises the number of records of each provider.
+-- Number of records of the vendor with vendor id 1 is 527386
+-- Number of records of the vendor with vendor id 2 is 647183
+SELECT ss_nyc.vendorid AS VENDOR, count(*) AS TOTAL FROM ss.ss_nyc
+GROUP BY vendorid;
+
+-- Percentage records has each TPEP provider provided? 
+-- Vendor Id 1 ==> 527,386 (44.9%)
+-- Vendor Id 2 ==> 647,183 (55.1%)
+SELECT vendorid, COUNT(vendorid), CAST(COUNT(*)*100/SUM(COUNT(*)) OVER() AS DECIMAL(10,2) ) AS VendorID_Percent 
+FROM ss.ss_nyc
+GROUP BY vendorid;
+
+-- DATA QUALITY ISSUE CHECK
+
+-- Check the range (minimum and maximum) of dates to check for dates beyond 2017
+-- There are date values which are not from the specified year. Thus, we will have to filter the data.
+-- Based on the result, we have a difference of two years in max pickup time and max dropoff time which seems INVALID
+SELECT vendorid, MIN(tpep_pickup_datetime) AS MIN_PICKUP_TIME, MIN(tpep_dropoff_datetime) AS MIN_DROPOFF_TIME, 
+MAX(tpep_pickup_datetime) AS MAX_PICKUP_TIME, MAX(tpep_dropoff_datetime) AS MAX_DROPOFF_TIME
+from ss.ss_nyc
+group by vendorid;
+
+-- Checking the min, max, and average hourly difference between pickup and dropp off time for each vendorid
+-- Clearly vendorid=1 has rows with unusual entries because it has negative difference and difference of around 1.5 years
+select vendorid, min(hour_diff) as minval,max(hour_diff) as maxval,avg(hour_diff) as average
+from 
+( select vendorid, (unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))/3600 as hour_diff
+from ss.ss_nyc) as hour_data
+group by vendorid;
+
+-- All the records are of vendor id 1 which are INVALID (negative or more than 24 hours hour_diff between pickup and dropoff times). There are 74 such records
+select vendorid, hour_diff
+ from 
+( select vendorid, (unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))/3600 as hour_diff
+from ss.ss_nyc) as hour_data
+where hour_diff<0 or hour_diff>24;
+
+-- CHECK IF THE TIP VALUES ARE NEGATIVE
+-- ONLY VENDORID 2 HAS 4 INSTANCES OF NEGATIVE TIP AMOUNT.
+SELECT vendorid, tip_amount FROM ss.ss_nyc
+WHERE tip_amount < 0
+ORDER BY tip_amount ASC;
+
+-- CHECK IF THERE ARE NEGATIVE FARE_AMOUNT
+-- MULTIPLE ROWS ARE NOTICED WITH NEGATIVE FARE_AMOUNT.
+SELECT vendorid, fare_amount FROM ss.ss_nyc
+WHERE fare_amount < 0
+ORDER BY fare_amount ASC;
+
+-- FIND THE COUNT OF NEGATIVE FARE AMOUNTS PER VENDOR
+-- ONLY VENDOR WITH VENDOR ID 2 HAS 558 INSTANCES OF NEGATIVE FARE AMOUNT
+SELECT vendorid, COUNT(fare_amount) FROM ss.ss_nyc
+WHERE fare_amount < 0
+GROUP BY vendorid;
+
+-- FIND THE COUNT OF OTHER EXTRA CHARGES BESIDES
+-- RUSH HOUR(0.5$) and OVERNIGHT CHARGE(1.0$) PER VENDOR
+-- WITH THE DISTRIBUTION OF CHARGES
+-- Vendor 1 has other charge amounts like -10.6,1.5,2.0,4.5
+-- Vendor 2 has other charge amounts like -0.5,-1.0,-4.5,0.3,0.8,1.3,4.5,4.8
+SELECT vendorid, extra,count(*) FROM ss.ss_nyc
+WHERE extra != 0.5 AND extra != 1.0 AND extra !=0
+GROUP BY vendorid, extra
+order by vendorid;
+
+-- FIND THE COUNT OF OTHER EXTRA CHARGES BESIDES
+-- RUSH HOUR(0.5$) and OVERNIGHT CHARGE(1.0$) PER VENDOR
+-- Vendorid 1 and 2 have  1823 and 3033 instances of other extra charges respectively
+-- besides the allowed Rush Hour (0.5$) and Overnight charge (1.0$)
+SELECT vendorid, count(*) FROM ss.ss_nyc
+WHERE extra != 0.5 AND extra != 1.0 AND extra !=0
+GROUP BY vendorid
+order by vendorid;
+
+
+-- CHECK FOR TRIPS WITH ZERO OR NEGATIVE PASSENGER COUNT
+-- Both vendors has negative passenger count.
+SELECT vendorid, passenger_count FROM ss.ss_nyc
+WHERE passenger_count <= 0
+ORDER BY passenger_count ASC;
+
+
+-- CHECK FOR TRIPS WITH ZERO PASSENGERS
+-- VENDOR 1 has 6813 trips with ZERO passengers
+-- VENDOR 2 has 11 trips with ZERO passengers
+SELECT vendorid, passenger_count, COUNT(passenger_count) FROM ss.ss_nyc
+WHERE passenger_count <= 0
+GROUP BY vendorid,passenger_count
+ORDER BY vendorid;
+
+
+-- CHECK FOR TRIPS WITH NEGATIVE TOLL CHARGE
+-- ONLY VENDOR 2 HAS 3 NEGATIVE TOLLS.
+SELECT vendorid, count(tolls_amount) as COUNT_NEGATIVE_TOLLS FROM ss.ss_nyc
+WHERE tolls_amount < 0
+GROUP BY vendorid;
+
+
+-- CHECK FOR TRIPS WITH NEGATIVE IMPROVEMENT_SURCHARGE
+-- ONLY VENDOR 2 HAS 558 INSTANCES OF NEGATIVE IMPROVEMENT SURCHARGE.
+SELECT vendorid, count(improvement_surcharge) as COUNT_NEGATIVE_IMPROVEMENT_CHARGE FROM ss.ss_nyc
+WHERE improvement_surcharge < 0
+GROUP BY vendorid;
+
+
+-- CHECKING FOR NEGATIVE MTA_TAX
+-- THERE ARE MULTIPLE INSTANCES OF NEGATIVE MTA_TAX
+SELECT vendorid, mta_tax
+FROM ss.ss_nyc
+WHERE mta_tax<0
+LIMIT 5;
+
+-- COUNTING INSTANCES FOR NEGATIVE MTA_TAX
+-- THERE ARE MULTIPLE INSTANCES OF NEGATIVE MTA_TAX
+-- VENDOR WITH VENDOR ID 2 HAVE 544 INSTANCES OF NEGATIVE MTA_TAX
+SELECT vendorid, count(*) as no_of_records
+FROM ss.ss_nyc
+WHERE mta_tax<0
+GROUP BY vendorid;
+
+-- CHECKING FOR NEGATIVE TOTAL_AMOUNT
+-- THERE ARE MULTIPLE INSTANCES OF NEGATIVE TOTAL_AMOUNT
+SELECT vendorid, total_amount
+FROM ss.ss_nyc
+WHERE total_amount<0
+LIMIT 5;
+
+-- COUNTING FOR NEGATIVE TOTAL_AMOUNT
+-- THERE ARE 558 INSTANCES OF NEGATIVE TOTAL_AMOUNT FOR VENDOR WITH VENDORID 2
+SELECT vendorid, count(*)
+FROM ss.ss_nyc
+WHERE total_amount<0
+GROUP BY vendorid;
+
+-- CHECKING INVALID VALUE FOR PAYMENT_TYPE
+-- NO INVALID VALUES FOR PAYMENT_TYPE
+SELECT vendorid,payment_type, count(*)
+FROM ss.ss_nyc
+GROUP BY vendorid,payment_type
+ORDER BY vendorid;
+
+-- CHECKING INVALID VALUE FOR STORE_AND_FWD_FLAG
+-- NO INVALID VALUES FOR STORE_AND_FWD_FLAG
+SELECT vendorid,store_and_fwd_flag, count(*)
+FROM ss.ss_nyc
+GROUP BY vendorid,store_and_fwd_flag
+ORDER BY vendorid;
+
+-- CHECKING INVALID VALUE FOR RATECODEID
+-- RATECODEID COLUMN HAS INCORRECT RECORDS WITH VALUE AS 99
+-- VENDOR WITH VENDORID 1 HAS 8 SUCH INSTANCES WHILE VENDORID 2 HAS ONLY 1 SUCH INSTANCE
+SELECT vendorid,ratecodeid, count(*)
+FROM ss.ss_nyc
+GROUP BY vendorid,ratecodeid
+ORDER BY vendorid;
+
+-- CHECKING FOR NEGATIVE TRIP_DISTANCE
+-- NO RECORD WITH NEGATIVE TRIP_DISTANCE IS THERE
+SELECT vendorid, trip_distance
+FROM ss.ss_nyc
+WHERE trip_distance<0;
+
+
+-- COUNTING OVERALL DATA QUALITY ISSUES FROM BOTH VENDOR IDS WITH METRICS LIKE HOUR DIFFERENCE BETWEEN PICK UP AND DROP OFF TIME, NEGATIVE FARE AMOUNT,
+-- NEGATIVE TIP AMOUNT, INVALID VALUE OF EXTRA CHARGES, NEGATIVE OR ZERO PASSENGER COUNTS, NEGATIVE TOLL CHARGE, NEGATIVE IMPROVEMENT SURCHARGE, 
+-- NEGATIVE MTA_TAX, NEGATIVE TOTAL AMOUNT AND INVALID VALUES OF RATE CODE ID.
+-- VENDOR ID 1 HAS 8684 WRONG RECORDS WHILE VENDOR ID 2 3332 WRONG RECORDS.
+-- THUS, AS PER OUR ANALYSIS ON DATA QUALITY ISSUES, VENDORID 1 HAS MORE INCORRECT RECORDS WHICH ARE MAINLY BECAUSE OF THE PASSENGER_COUNT WRONG ENTRIES 
+-- WHILE VENDORID 2 HAS MORE INCORRECT RECORDS IN THE REST OF THE COLUMNS
+-- WE CONCLUDE THAT VENDOR ID 1 IS DOING A BAD JOB IN PROVIDING THE RECORDS.
+
+
+SELECT vendorid,count(*)
+FROM
+(SELECT vendorid,fare_amount,tip_amount,extra,passenger_count,tolls_amount,improvement_surcharge,mta_tax,total_amount,ratecodeid,tpep_pickup_datetime,
+(unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))/3600 as hour_diff
+FROM ss.ss_nyc) as data_issues
+WHERE fare_amount<0 or tip_amount<0 or (extra!=0 and extra!=0.5 and extra!=1.0) or passenger_count<=0 or tolls_amount<0 or improvement_surcharge<0 or mta_tax<0
+or total_amount<0 or ratecodeid='99' or hour_diff<0 or hour_diff>24 or year(tpep_pickup_datetime)!=2017 or not(month(tpep_pickup_datetime) in (11,12))
+GROUP BY vendorid
+ORDER BY vendorid;
+
+-- DROPPING TABLE IF IT EXISTS
+DROP TABLE ss_nyc_part_clustered;
+
+-- CREATING THE ORC PARITIONED AND CLUSTERED TABLE AS REQUIRED FOR THE ANALYSIS
+-- PARTITIONED BY YR AND MNTH
+-- CLUSTERED BY TIP_AMOUNT
+CREATE EXTERNAL TABLE IF NOT EXISTS ss_nyc_part_clustered
+(vendorid string, tpep_pickup_datetime timestamp, tpep_dropoff_datetime timestamp, Passenger_count int, Trip_distance double, PULocationID string, DOLocationID string,
+RateCodeID string, Store_and_fwd_flag string, Payment_type string, Fare_amount  double, Extra double, MTA_tax double, Improvement_surcharge double,
+Tip_amount double, Tolls_amount  double, Total_amount  double) PARTITIONED BY (yr int, mnth int)
+CLUSTERED BY (tip_amount) SORTED BY (tip_amount) into 5 buckets
+STORED AS ORC
+LOCATION '/user/hive/warehouse/ss_nyc_part_clustered'
+tblproperties("orc.compress" = "SNAPPY");
+
+
+INSERT OVERWRITE TABLE ss_nyc_part_clustered PARTITION(yr,mnth)
+SELECT vendorid, tpep_pickup_datetime,tpep_dropoff_datetime,passenger_count,trip_distance,pulocationid,dolocationid,ratecodeid,store_and_fwd_flag,payment_type,
+fare_amount,extra,mta_tax,improvement_surcharge,tip_amount,tolls_amount,total_amount,year(tpep_pickup_datetime) as yr, month(tpep_pickup_datetime) as mnth
+FROM(
+SELECT vendorid, tpep_pickup_datetime,tpep_dropoff_datetime,passenger_count,trip_distance,pulocationid,dolocationid,ratecodeid,store_and_fwd_flag,payment_type,
+fare_amount,extra,mta_tax,improvement_surcharge,tip_amount,tolls_amount,total_amount, (unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))/3600 as hour_diff
+FROM ss.ss_nyc) as final_col
+WHERE fare_amount>=0 and tip_amount>=0 and (extra=0 or extra=0.5 or extra=1.0) and passenger_count>0 and tolls_amount>=0 and improvement_surcharge>=0 and mta_tax>=0
+and total_amount>=0 and ratecodeid!='99' and year(tpep_pickup_datetime)=2017 and month(tpep_pickup_datetime) in (11,12) and hour_diff>=0 and hour_diff<=24;
+
+-- CHECKING IF THE CLUSTERED AND PARTITIONED TABLE IS CORRECT
+SELECT *
+FROM ss_nyc_part_clustered
+WHERE fare_amount<0 or tip_amount<0 or (extra!=0 and extra!=0.5 and extra!=1.0) or passenger_count<=0 or tolls_amount<0 or improvement_surcharge<0 or mta_tax<0
+or total_amount<0 or ratecodeid='99' or year(tpep_pickup_datetime)!=2017 or not(month(tpep_pickup_datetime) in (11,12));
+
+SELECT * from ss_nyc_part_clustered
+LIMIT 5;
+
+-- TOTAL NUMBER OF RECORDS FROM VENDORID=1 IS 518702 AND TOTAL NUMBER OF RECORDS FROM VENDORID=2 IS 643851
+SELECT vendorid, count(*)
+FROM ss_nyc_part_clustered
+GROUP BY vendorid;
+
+-------------
+-- ANALYSIS -1
+--------------
+-- 1. COMPARE THE OVERALL AVERAGE FARE PER TRIP FOR NOVEMBER AND DECEMBER.
+-- THE AVERAGE FARE PER TRIP FOR NOVEMBER AND DECEMBER
+-- IS 12.96$ AND 12.76$ RESPECTIVELY
+-- AVERAGE TRIPS FOR BOTH THE MONTHS ARE APPROXIMATELY EQUAL.
+SELECT mnth, ROUND(avg(fare_amount),2) AS avg FROM ss_nyc_part_clustered
+GROUP BY mnth;
+
+-- 2. EXPLORE THE ‘NUMBER OF PASSENGERS PER TRIP’ - HOW MANY TRIPS ARE MADE BY EACH LEVEL OF ‘PASSENGER_COUNT’? 
+-- DO MOST PEOPLE TRAVEL SOLO OR WITH OTHER PEOPLE?
+-- MOST PEOPLE TRAVEL SOLO (70.89%)
+SELECT PASSENGER_COUNT AS LEVEL, COUNT(*) AS NUMBER_OF_TRIPS, CAST(COUNT(*)*100/SUM(COUNT(*)) OVER() AS DECIMAL(10,2) ) AS PCT_NUMBER_OF_TRIPS FROM ss_nyc_part_clustered
+GROUP BY PASSENGER_COUNT
+ORDER BY NUMBER_OF_TRIPS DESC, PCT_NUMBER_OF_TRIPS DESC;
+
+-- 3. WHICH IS THE MOST PREFERRED MODE OF PAYMENT?
+-- THE PREFERRED MPDE OF PAYMENT IS CREDIT CARD (67.32%)
+SELECT payment_type AS PAYMT_TYPE, COUNT(*) AS PAYMT_CNT, CAST(COUNT(*)*100/SUM(COUNT(*)) OVER() AS DECIMAL(10,2) ) AS PCT_PAYMT_CNT FROM ss_nyc_part_clustered
+GROUP BY payment_type
+ORDER BY PAYMT_CNT DESC, PCT_PAYMT_CNT DESC;
+
+-- 4. WHAT IS THE AVERAGE TIP PAID PER TRIP? 
+-- COMPARE THE AVERAGE TIP WITH THE 25TH, 50TH AND 75TH PERCENTILES AND COMMENT WHETHER THE ‘AVERAGE TIP’ IS A 
+-- REPRESENTATIVE STATISTIC (OF THE CENTRAL TENDENCY) OF ‘TIP AMOUNT PAID’. 
+-- HINT: YOU MAY USE PERCENTILE_APPROX(DOUBLE COL, P): 
+-- RETURNS AN APPROXIMATE PTH PERCENTILE OF A NUMERIC COLUMN (INCLUDING FLOATING POINT TYPES) IN THE GROUP.
+
+-- THE AVERAGE TIP AMOUNT WAS 1.83$
+SELECT ROUND(AVG(tip_amount),2) FROM ss_nyc_part_clustered;
+
+-- The tip amount for 25th, 50th and 70th percentile were 0.0$, 1.35$ and 2.45$ respectively.
+SELECT percentile_approx(tip_amount, array(0.25,0.50,0.75)) FROM ss_nyc_part_clustered;
+
+-- The average tip is a representative statsitic of the tip amount paid as it lies between the 50th and 75th percentile and is closer to median value.
+
+-- 5. EXPLORE THE ‘EXTRA’ (CHARGE) VARIABLE - WHAT FRACTION OF TOTAL TRIPS HAVE AN EXTRA CHARGE IS LEVIED?
+-- 0.46 (46%) OF THE TOAL TRIPS HAD EXTRA CHARGE LEVIED.
+SELECT ROUND(extra/total,2) AS PCT_TRIPS_WITH_EXTRA_CHARGE FROM 
+(SELECT count(*) as extra FROM ss_nyc_part_clustered WHERE extra >0) AS INNER1,
+(SELECT count(*) as total FROM ss_nyc_part_clustered) AS INNER2;
+
+
+--------------
+-- Analysis-II
+--------------
+
+-- 1. WHAT IS THE CORRELATION BETWEEN THE NUMBER OF PASSENGERS ON ANY GIVEN TRIP, AND THE TIP PAID PER TRIP? 
+-- THERE IS ZERO CORRELATION FOUND BETWEEN THE NUMBER OF PASSENGERS AND TIP PAID PER TRIP.
+SELECT ROUND(CORR(passenger_count, tip_amount),2) FROM ss_nyc_part_clustered;
+
+-- DO MULTIPLE TRAVELLERS TIP MORE COMPARED TO SOLO TRAVELLERS? 
+-- THE AVERAGE TIP OF MULTIPLE TRAVELLERS ARE HIGHER WHEN COMPARED TO SOLO TRAVELLERS BUT AS ANSWERED, THERE IS HARDLY ANY CORRELATION BETWEEN TIP AMOUNT AND NUMBER OF PASSENGERS
+-- IN THE MULTIPLE TRAVELLERS SEGMENT, LEVEL 7 (7-PASSENGERS) ARE FOUND TO TIP MORE.
+SELECT passenger_count AS LEVEL, AVG(tip_amount) AS AVG_TIP_AMT FROM ss_nyc_part_clustered
+GROUP BY passenger_count
+ORDER BY AVG_TIP_AMT DESC;
+
+-- 2.SEGREGATE THE DATA INTO FIVE SEGMENTS OF ‘TIP PAID’: [0-5), [5-10), [10-15) , [15-20) AND >=20. 
+-- CALCULATE THE PERCENTAGE SHARE OF EACH BUCKET (I.E. THE FRACTION OF TRIPS FALLING IN EACH BUCKET).
+-- [0-5) SEGMENT HAS MOST OF THE RECORDS EQUAL TO 92.33% OF RECORDS WHILE >=20 SEGMENT HAS THE LOWEST PERCENTAGE OF RECORDS
+-- AS THE TIP AMOUNT INCREASES, THE PERCENTAGE OF RECORDS DECREASE.
+
+SELECT tip_segment, CAST(COUNT(*)*100/SUM(COUNT(*)) OVER() AS DECIMAL(10,2)) as tip_segment_percent
+FROM 
+(SELECT tip_amount, 
+(CASE
+WHEN tip_amount<5 then '[0-5)'
+WHEN tip_amount>=5 and tip_amount<10 then '[5-10)'
+WHEN tip_amount>=10 and tip_amount<15 then '[10-15)'
+WHEN tip_amount>=15 and tip_amount<20 then '[15-20)'
+ELSE '>=20'
+END) AS tip_segment
+FROM ss_nyc_part_clustered) as segregated
+GROUP BY tip_segment
+ORDER BY tip_segment_percent DESC;
+
+
+-- 3. WHICH MONTH HAS A GREATER AVERAGE ‘SPEED’ - NOVEMBER OR DECEMBER? 
+-- NOTE THAT THE VARIABLE ‘SPEED’ WILL HAVE TO BE DERIVED FROM OTHER METRICS. 
+-- SPEED = DISTANCE / TIME
+-- THE MONTH OF DECEMBER HAS A GREATER AVERAGE SPEED (11.05 MILES/HOUR)
+SELECT mnth, ROUND(AVG(trip_distance /((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600)),2) AS AVG_Speed_per_Hour
+FROM ss_nyc_part_clustered
+GROUP BY mnth
+ORDER BY AVG_Speed_per_Hour;
+
+-- 4.ANALYSE THE AVERAGE SPEED OF THE MOST HAPPENING DAYS OF THE YEAR, 
+-- I.E. 31ST DECEMBER (NEW YEAR’S EVE) AND 25TH DECEMBER (CHRISTMAS) AND COMPARE IT WITH THE OVERALL AVERAGE. 
+-- FIND THE AVERAGE SPEED IN THE YEAR 2017
+-- THE AVERAGE SPEED IN 2017 IS 11MPH (MILES PER HOUR)
+SELECT  ROUND(AVG(trip_distance / ((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600)),2) AS AVG_Speed_in_2017
+FROM ss_nyc_part_clustered
+WHERE YEAR(tpep_pickup_datetime) = 2017;
+
+-- FIND THE AVERAGE SPEED PER HOUR ON DEC 25 AND DEC 31
+-- THE AVERAGE SPEED ON DEC 25TH AND 31ST ARE 15.24  MPH AND 13.21 MPH (MILES PER HOUR)
+SELECT date(tpep_pickup_datetime), ROUND(AVG(trip_distance / ((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600)),2) AS AVG_Speed_per_Hour
+FROM ss_nyc_part_clustered
+WHERE mnth in (12) AND DAY(tpep_pickup_datetime) in (25,31)
+GROUP BY date(tpep_pickup_datetime);
+
+-- WE COULD NOTICE THE AVERAGE SPEED PER HOUR ON THE MOST HAPPENINGS IN THE YEAR ARE HIGHER THAN THE YEARLY AVERAGE.
+-- IT INDICATES HIGH DEMAND FOR TAXI
+-- HIGHER DEMAND COULD TRANSLATE TO MORE REVENUE TO THE TAXI VENDOR AND ALSO FOR THE TAXI DRIVERS IN THE FORM OF REVENUE AND TIPS.
